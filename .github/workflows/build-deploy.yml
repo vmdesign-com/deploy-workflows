@@ -1,0 +1,361 @@
+# Zentraler Build- & Deploy-Workflow für alle vmDesign-Websites.
+#
+# Wird von jedem Website-Repo über `uses:` aufgerufen (siehe website-vorlage/deploy.yml).
+# Ablauf: Code holen → Abhängigkeiten installieren → bauen → Ergebnis prüfen
+#         → per SFTP hochladen (erst Assets, dann HTML, dann Altlasten löschen)
+#         → Live-Check der Website.
+# Schlägt ein Schritt fehl, wird nichts (weiter) hochgeladen und GitHub schickt eine E-Mail.
+
+name: Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      remote-path:
+        description: "Zielordner am Server, relativ zum SFTP-Home (z. B. public_html oder kunde-a.at) oder absolut"
+        type: string
+        required: true
+      site-url:
+        description: "Optional: URL der Live-Seite für den Check nach dem Upload"
+        type: string
+        default: ""
+      node-version:
+        description: "Node-Version für den Build"
+        type: string
+        default: "22"
+      build-command:
+        description: "Optional: eigener Build-Befehl (Standard: <paketmanager> run build)"
+        type: string
+        default: ""
+      output-dir:
+        description: "Ordner mit der fertigen Seite"
+        type: string
+        default: "dist"
+      working-directory:
+        description: "Ordner mit der package.json (für Monorepos)"
+        type: string
+        default: "."
+      keep-remote:
+        description: "Pfade am Server (Leerzeichen-getrennt, relativ zum Zielordner), die nie gelöscht oder überschrieben werden"
+        type: string
+        default: ".well-known cgi-bin .ftpquota"
+      max-delete:
+        description: "Abbruch, wenn mehr als so viele Dateien/Ordner am Server gelöscht würden (0 = keine Grenze)"
+        type: number
+        default: 200
+    secrets:
+      SFTP_HOST:
+        required: true
+      SFTP_USER:
+        required: true
+      SFTP_PORT:
+        required: false
+      SFTP_PASSWORD:
+        required: false
+      SSH_PRIVATE_KEY:
+        required: false
+      SFTP_KNOWN_HOSTS:
+        required: false
+      BUILD_ENV:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Pro Website läuft immer nur ein Deploy. Kommen währenddessen weitere Auslöser,
+    # wartet genau einer (der neueste) und startet danach. Ein laufender Upload wird
+    # nie abgebrochen, damit die Seite nie halb hochgeladen bleibt.
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      OUTPUT_DIR: ${{ inputs.output-dir }}
+      REMOTE_PATH: ${{ inputs.remote-path }}
+
+    steps:
+      - name: Auslöser protokollieren
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "Ausgelöst durch: $EVENT ${ACTION:+($ACTION)} von $ACTOR"
+
+      - name: Code holen
+        uses: actions/checkout@v6
+
+      - name: Paketmanager erkennen
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm; cache=""
+          elif [ -f yarn.lock ]; then pm=yarn; cache=""
+          elif [ -f package-lock.json ]; then pm=npm; cache=npm
+          else pm=npm; cache=""
+          fi
+          echo "name=$pm" >> "$GITHUB_OUTPUT"
+          echo "cache=$cache" >> "$GITHUB_OUTPUT"
+          echo "Paketmanager: $pm"
+
+      - name: Node einrichten
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ steps.pm.outputs.cache }}
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Abhängigkeiten installieren
+        env:
+          PM: ${{ steps.pm.outputs.name }}
+        run: |
+          case "$PM" in
+            pnpm) corepack enable && pnpm install --frozen-lockfile ;;
+            yarn) corepack enable && yarn install --frozen-lockfile ;;
+            npm)
+              if [ -f package-lock.json ]; then npm ci
+              else
+                echo "::warning::Keine package-lock.json gefunden – verwende 'npm install'. Lockfile committen für reproduzierbare Builds."
+                npm install
+              fi ;;
+          esac
+
+      - name: Build-Umgebungsvariablen setzen
+        env:
+          BUILD_ENV: ${{ secrets.BUILD_ENV }}
+        run: |
+          if [ -z "$BUILD_ENV" ]; then
+            echo "Keine BUILD_ENV hinterlegt – überspringe."
+            exit 0
+          fi
+          # Als .env-Datei für Astro/Vite …
+          printf '%s\n' "$BUILD_ENV" > .env
+          # … und als Prozess-Umgebung für astro.config & Co.
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in ''|'#'*) continue ;; *=*) ;; *) echo "::warning::Zeile in BUILD_ENV übersprungen (kein KEY=VALUE)"; continue ;; esac
+            key="${line%%=*}"; val="${line#*=}"
+            key="$(echo "$key" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]+$//')"
+            [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "::warning::Zeile in BUILD_ENV übersprungen (kein KEY=VALUE)"; continue; }
+            # umschließende Anführungszeichen entfernen
+            if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+            if [ "${#val}" -ge 8 ]; then echo "::add-mask::$val"; fi
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done <<< "$BUILD_ENV"
+          echo "BUILD_ENV gesetzt."
+
+      - name: Bauen
+        env:
+          PM: ${{ steps.pm.outputs.name }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          if [ -n "$BUILD_COMMAND" ]; then
+            eval "$BUILD_COMMAND"
+          else
+            "$PM" run build
+          fi
+
+      - name: Build-Ergebnis prüfen
+        run: |
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "::error::Ordner '$OUTPUT_DIR' existiert nach dem Build nicht. Stimmt 'output-dir'?"
+            exit 1
+          fi
+          if [ ! -f "$OUTPUT_DIR/index.html" ]; then
+            echo "::error::'$OUTPUT_DIR/index.html' fehlt – Upload abgebrochen, damit die Live-Seite nicht überschrieben wird."
+            exit 1
+          fi
+          files=$(find "$OUTPUT_DIR" -type f | wc -l)
+          size=$(du -sh "$OUTPUT_DIR" | cut -f1)
+          echo "Build ok: $files Dateien, $size"
+          echo "BUILD_FILES=$files" >> "$GITHUB_ENV"
+
+      - name: Zielordner prüfen
+        run: |
+          p="${REMOTE_PATH%/}"
+          if [ -z "$p" ] || [ "$p" = "." ] || [ "$p" = "~" ] || [[ "$p" == *..* ]] \
+             || [[ "$p" =~ ^/+$ ]] || [[ "$p" =~ ^/[^/]+$ ]] || [[ "$p" =~ ^/home/[^/]+$ ]]; then
+            echo "::error::Unsicherer Zielordner '$REMOTE_PATH'. Bitte einen eigenen Ordner pro Website angeben, z. B. public_html oder kunde-a.at."
+            exit 1
+          fi
+          echo "Zielordner: $p"
+
+      - name: lftp installieren
+        run: |
+          if ! command -v lftp >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq lftp >/dev/null
+          fi
+          lftp --version | head -1
+
+      - name: SSH vorbereiten
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_KNOWN_HOSTS: ${{ secrets.SFTP_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          port="${SFTP_PORT:-22}"
+          if [ -n "$SFTP_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SFTP_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            echo "Server-Schlüssel aus SFTP_KNOWN_HOSTS übernommen."
+          else
+            ssh-keyscan -p "$port" -T 15 "$SFTP_HOST" > ~/.ssh/known_hosts 2>/dev/null || true
+            if [ ! -s ~/.ssh/known_hosts ]; then
+              echo "::error::Server $SFTP_HOST:$port nicht erreichbar (ssh-keyscan ohne Antwort). Host/Port prüfen."
+              exit 1
+            fi
+            echo "::notice::Kein SFTP_KNOWN_HOSTS hinterlegt – Server-Schlüssel wurde live abgefragt. Für mehr Sicherheit den Inhalt unten als Secret SFTP_KNOWN_HOSTS speichern."
+            cat ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            echo "Anmeldung per SSH-Schlüssel."
+          elif [ -n "$SFTP_PASSWORD" ]; then
+            echo "Anmeldung per Passwort."
+          else
+            echo "::error::Weder SSH_PRIVATE_KEY noch SFTP_PASSWORD hinterlegt."
+            exit 1
+          fi
+
+      - name: Hochladen (SFTP)
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          LFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
+          KEEP_REMOTE: ${{ inputs.keep-remote }}
+          MAX_DELETE: ${{ inputs.max-delete }}
+        run: |
+          set -euo pipefail
+          port="${SFTP_PORT:-22}"
+          remote="${REMOTE_PATH%/}"
+          local_dir="$(cd "$OUTPUT_DIR" && pwd)"
+          work="$(mktemp -d)"
+
+          ssh_cmd="ssh -a -x -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ServerAliveInterval=15 -o ConnectTimeout=20"
+          if [ -f "$HOME/.ssh/deploy_key" ]; then
+            ssh_cmd="$ssh_cmd -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -i $HOME/.ssh/deploy_key"
+            open_cmd="open -u \"$SFTP_USER\", -p $port sftp://$SFTP_HOST"
+          else
+            ssh_cmd="$ssh_cmd -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+            open_cmd="open --env-password -u \"$SFTP_USER\" -p $port sftp://$SFTP_HOST"
+          fi
+
+          # Geschützte Pfade am Server: werden weder gelöscht noch überschrieben
+          excludes=""
+          for p in $KEEP_REMOTE; do
+            p="${p#/}"; p="${p%/}"
+            [ -n "$p" ] || continue
+            # shellcheck disable=SC2016
+            esc="$(printf '%s' "$p" | sed 's/[][\.*^$()+?{}|]/\\&/g')"
+            excludes="$excludes --exclude '^${esc}(/|\$)'"
+          done
+          mirror_opts="--reverse --verbose=1 --parallel=4 --no-perms --overwrite"
+
+          preamble() {
+            cat <<EOF
+          set cmd:fail-exit yes
+          set net:max-retries 4
+          set net:reconnect-interval-base 5
+          set net:reconnect-interval-multiplier 2
+          set net:timeout 30
+          set sftp:auto-confirm no
+          set sftp:connect-program "$ssh_cmd"
+          $open_cmd
+          mkdir -p -f "$remote"
+          cd "$remote"
+          EOF
+          }
+
+          # --- Probelauf: Was würde gelöscht? -------------------------------
+          { preamble
+            echo "mirror $mirror_opts --dry-run --delete $excludes \"$local_dir\" ."
+            echo "bye"; } > "$work/plan.lftp"
+          lftp -f "$work/plan.lftp" > "$work/plan.txt"
+          grep -E '^rm ' "$work/plan.txt" > "$work/deletes.txt" || true
+          n_del=$(wc -l < "$work/deletes.txt" | tr -d ' ')
+          n_up=$(grep -cE '^(put|get) ' "$work/plan.txt" || true)
+          echo "Plan: $n_up Dateien hochladen, $n_del Einträge am Server löschen."
+          if [ "$n_del" -gt 0 ]; then
+            echo "Zu löschen:"; sed 's/^/  /' "$work/deletes.txt" | head -50
+          fi
+
+          # Schutz 1: Ordner mit Domain-Namen (z. B. Addon-Domains in public_html) nie löschen
+          blocked=""
+          rel_prefix="/${remote#/}/"
+          while IFS= read -r line; do
+            case "$line" in "rm -r "*) ;; *) continue ;; esac
+            url="${line#rm -r }"
+            rel="${url#*"$rel_prefix"}"
+            rel="${rel%/}"
+            if [[ "$rel" != */* && "$rel" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then
+              blocked="$blocked $rel"
+            fi
+          done < "$work/deletes.txt"
+          if [ -n "$blocked" ]; then
+            echo "::error::Abbruch: Der Deploy würde die Ordner${blocked} am Server löschen. Das sieht nach anderen Websites aus. Ordner in 'keep-remote' eintragen oder einen eigenen Zielordner verwenden."
+            exit 1
+          fi
+
+          # Schutz 2: ungewöhnlich viele Löschungen
+          if [ "${MAX_DELETE:-0}" -gt 0 ] && [ "$n_del" -gt "$MAX_DELETE" ]; then
+            echo "::error::Abbruch: $n_del Löschungen geplant (Grenze: $MAX_DELETE). Liste oben prüfen und bei Bedarf 'max-delete' einmalig erhöhen."
+            exit 1
+          fi
+
+          # --- Echter Upload ----------------------------------------------
+          { preamble
+            echo "# 1. Alle Nicht-HTML-Dateien (CSS, JS, Bilder …) – bestehende Seiten funktionieren weiter"
+            echo "mirror $mirror_opts --exclude '\\.html\$' $excludes \"$local_dir\" ."
+            echo "# 2. HTML-Seiten hochladen und veraltete Dateien entfernen"
+            echo "mirror $mirror_opts --delete $excludes \"$local_dir\" ."
+            echo "bye"; } > "$work/deploy.lftp"
+
+          echo "Lade nach $SFTP_HOST:$remote hoch …"
+          lftp -f "$work/deploy.lftp"
+          echo "Upload abgeschlossen."
+
+      - name: Live-Check
+        if: ${{ inputs.site-url != '' }}
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+        run: |
+          sep='?'; case "$SITE_URL" in *'?'*) sep='&' ;; esac
+          url="${SITE_URL}${sep}deploy=${GITHUB_RUN_ID}"
+          code=$(curl -sSL -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 5 --retry-all-errors --max-time 30 "$url" || echo 000)
+          if [ "$code" != "200" ]; then
+            echo "::error::Live-Check fehlgeschlagen: $SITE_URL antwortet mit HTTP $code"
+            exit 1
+          fi
+          echo "Live-Check ok: $SITE_URL (HTTP 200)"
+
+      - name: Zusammenfassung
+        if: ${{ always() }}
+        env:
+          STATUS: ${{ job.status }}
+          SITE_URL: ${{ inputs.site-url }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          {
+            if [ "$STATUS" = "success" ]; then echo "### ✅ Deploy erfolgreich"; else echo "### ❌ Deploy fehlgeschlagen ($STATUS)"; fi
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Auslöser | $EVENT ${ACTION:+($ACTION)} |"
+            echo "| Zielordner | \`$REMOTE_PATH\` |"
+            echo "| Dateien | ${BUILD_FILES:-–} |"
+            if [ -n "$SITE_URL" ]; then echo "| Website | $SITE_URL |"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
