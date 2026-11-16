@@ -1,9 +1,12 @@
 # Zentraler Build- & Deploy-Workflow für alle vmDesign-Websites.
 #
 # Wird von jedem Website-Repo über `uses:` aufgerufen (siehe website-vorlage/deploy.yml).
-# Ablauf: Code holen → Abhängigkeiten installieren → bauen → Ergebnis prüfen
-#         → per SFTP hochladen (erst Assets, dann HTML, dann Altlasten löschen)
+# Ablauf: (nur nachts) prüfen, ob sich Inhalte oder Code geändert haben
+#         → Code holen → Abhängigkeiten installieren → bauen → Ergebnis prüfen
+#         → per SFTP/FTPS hochladen (erst Assets, dann HTML, dann Altlasten löschen)
 #         → Live-Check der Website.
+# Jeder Deploy legt /deploy-info.json mit Sanity-Fingerabdruck und Commit auf den Server.
+# Der nächtliche Lauf vergleicht damit und baut nur, wenn sich etwas geändert hat.
 # Schlägt ein Schritt fehl, wird nichts (weiter) hochgeladen und GitHub schickt eine E-Mail.
 
 name: Build & Deploy
@@ -12,9 +15,21 @@ on:
   workflow_call:
     inputs:
       remote-path:
-        description: "Zielordner am Server, relativ zum SFTP-Home (z. B. public_html oder kunde-a.at) oder absolut"
+        description: "Zielordner am Server, relativ zum Login-Ordner (z. B. public_html oder kunde-a.at) oder absolut"
         type: string
         required: true
+      protocol:
+        description: "Übertragungsart: sftp (Standard), ftps (FTP mit TLS, Port 21), ftps-implicit (Port 990) oder ftp (unverschlüsselt)"
+        type: string
+        default: "sftp"
+      verify-certificate:
+        description: "Nur FTPS: TLS-Zertifikat des Servers prüfen. Auf false setzen, wenn der Hoster ein Zertifikat für einen anderen Namen verwendet."
+        type: boolean
+        default: true
+      allow-root:
+        description: "Erlaubt '/' oder '.' als Zielordner, wenn der FTP-Zugang direkt im Web-Ordner der Website landet"
+        type: boolean
+        default: false
       site-url:
         description: "Optional: URL der Live-Seite für den Check nach dem Upload"
         type: string
@@ -43,6 +58,18 @@ on:
         description: "Abbruch, wenn mehr als so viele Dateien/Ordner am Server gelöscht würden (0 = keine Grenze)"
         type: number
         default: 200
+      sanity-project-id:
+        description: "Sanity-Projekt-ID. Nötig, damit der nächtliche Lauf Inhaltsänderungen erkennt."
+        type: string
+        default: ""
+      sanity-dataset:
+        description: "Sanity-Dataset"
+        type: string
+        default: "production"
+      only-if-content-changed:
+        description: "Nur bauen, wenn sich Sanity-Inhalte oder Code seit dem letzten Deploy geändert haben (für den nächtlichen Lauf)"
+        type: boolean
+        default: false
     secrets:
       SFTP_HOST:
         required: true
@@ -58,13 +85,87 @@ on:
         required: false
       BUILD_ENV:
         required: false
+      SANITY_READ_TOKEN:
+        required: false
 
 permissions:
   contents: read
 
 jobs:
+  check:
+    name: Änderungen prüfen
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+      sanity-hash: ${{ steps.sanity.outputs.hash }}
+    steps:
+      - name: Sanity-Stand ermitteln
+        id: sanity
+        if: ${{ inputs.sanity-project-id != '' }}
+        env:
+          PROJECT_ID: ${{ inputs.sanity-project-id }}
+          DATASET: ${{ inputs.sanity-dataset }}
+          TOKEN: ${{ secrets.SANITY_READ_TOKEN }}
+        run: |
+          # Fingerabdruck aller veröffentlichten Dokumente (ID + Revision).
+          # Erkennt neue, geänderte und gelöschte Inhalte.
+          query='*[] | order(_id asc) {_id, _rev}'
+          url="https://${PROJECT_ID}.api.sanity.io/v2025-02-19/data/query/${DATASET}"
+          auth=()
+          if [ -n "$TOKEN" ]; then auth=(-H "Authorization: Bearer $TOKEN"); fi
+          if ! body=$(curl -sS --fail --max-time 60 --retry 3 --retry-delay 5 -G "$url" \
+                --data-urlencode "query=$query" --data-urlencode "perspective=published" "${auth[@]}"); then
+            echo "::warning::Sanity-Abfrage fehlgeschlagen – Inhaltsstand unbekannt."
+            exit 0
+          fi
+          count=$(jq '.result | length' <<< "$body")
+          if [ "$count" -eq 0 ]; then
+            echo "::warning::Sanity liefert 0 Dokumente. Ist das Dataset privat? Dann ein Lesetoken als Secret SANITY_READ_TOKEN hinterlegen."
+            exit 0
+          fi
+          hash=$(jq -c '.result' <<< "$body" | sha256sum | cut -c1-16)
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "Sanity: $count Dokumente, Fingerabdruck $hash"
+
+      - name: Entscheiden
+        id: decide
+        env:
+          ONLY_IF_CHANGED: ${{ inputs.only-if-content-changed }}
+          SITE_URL: ${{ inputs.site-url }}
+          HASH: ${{ steps.sanity.outputs.hash }}
+          PROJECT_ID: ${{ inputs.sanity-project-id }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          go() {
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "→ Deploy: $1"
+            exit 0
+          }
+          [ "$ONLY_IF_CHANGED" = "true" ] || go "direkt ausgelöst ($EVENT)"
+          [ -n "$SITE_URL" ] || go "keine site-url zum Vergleichen hinterlegt"
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::warning::Keine sanity-project-id gesetzt – nachts werden nur Code-Änderungen erkannt."
+          elif [ -z "$HASH" ]; then
+            go "Sanity-Stand unbekannt, sicherheitshalber neu bauen"
+          fi
+          info=$(curl -sSL --fail --max-time 30 --retry 2 "${SITE_URL%/}/deploy-info.json?t=$(date +%s)" 2>/dev/null) \
+            || go "deploy-info.json auf der Website nicht gefunden (erster Lauf?)"
+          live_hash=$(jq -r '.sanity // ""' <<< "$info" 2>/dev/null) || go "deploy-info.json nicht lesbar"
+          live_commit=$(jq -r '.commit // ""' <<< "$info")
+          echo "Online:  Sanity ${live_hash:-–}, Commit ${live_commit:0:7}"
+          echo "Aktuell: Sanity ${HASH:-–}, Commit ${SHA:0:7}"
+          if [ -n "$HASH" ] && [ "$HASH" != "$live_hash" ]; then go "Sanity-Inhalte haben sich geändert"; fi
+          if [ "$SHA" != "$live_commit" ]; then go "Code-Stand online weicht ab"; fi
+          echo "deploy=false" >> "$GITHUB_OUTPUT"
+          echo "Keine Änderungen seit dem letzten Deploy – nichts zu tun."
+          echo "### 💤 Keine Änderungen – Deploy übersprungen" >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     name: Build & Deploy
+    needs: check
+    if: ${{ needs.check.outputs.deploy == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Pro Website läuft immer nur ein Deploy. Kommen währenddessen weitere Auslöser,
@@ -80,6 +181,7 @@ jobs:
     env:
       OUTPUT_DIR: ${{ inputs.output-dir }}
       REMOTE_PATH: ${{ inputs.remote-path }}
+      PROTOCOL: ${{ inputs.protocol }}
 
     steps:
       - name: Auslöser protokollieren
@@ -177,15 +279,43 @@ jobs:
           echo "Build ok: $files Dateien, $size"
           echo "BUILD_FILES=$files" >> "$GITHUB_ENV"
 
-      - name: Zielordner prüfen
+      - name: Deploy-Info schreiben
+        env:
+          HASH: ${{ needs.check.outputs.sanity-hash }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
         run: |
-          p="${REMOTE_PATH%/}"
-          if [ -z "$p" ] || [ "$p" = "." ] || [ "$p" = "~" ] || [[ "$p" == *..* ]] \
-             || [[ "$p" =~ ^/+$ ]] || [[ "$p" =~ ^/[^/]+$ ]] || [[ "$p" =~ ^/home/[^/]+$ ]]; then
-            echo "::error::Unsicherer Zielordner '$REMOTE_PATH'. Bitte einen eigenen Ordner pro Website angeben, z. B. public_html oder kunde-a.at."
+          jq -n --arg sanity "$HASH" --arg commit "$SHA" --arg event "$EVENT" \
+                --arg zeit "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '{sanity: $sanity, commit: $commit, ausloeser: $event, zeit: $zeit}' > "$OUTPUT_DIR/deploy-info.json"
+          cat "$OUTPUT_DIR/deploy-info.json"
+
+      - name: Zielordner und Protokoll prüfen
+        env:
+          ALLOW_ROOT: ${{ inputs.allow-root }}
+        run: |
+          case "$PROTOCOL" in
+            sftp|ftps|ftps-implicit) ;;
+            ftp) echo "::warning::Unverschlüsseltes FTP: Passwort und Dateien gehen im Klartext übers Netz. Wenn der Hoster es anbietet, 'ftps' oder 'sftp' verwenden." ;;
+            *) echo "::error::Unbekanntes Protokoll '$PROTOCOL'. Erlaubt: sftp, ftps, ftps-implicit, ftp."; exit 1 ;;
+          esac
+          p="$REMOTE_PATH"
+          while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+          if [ -z "$p" ] || [ "$p" = "~" ] || [[ "$p" == *..* ]]; then
+            echo "::error::Unsicherer Zielordner '$REMOTE_PATH'."
             exit 1
           fi
-          echo "Zielordner: $p"
+          if [ "$p" = "/" ] || [ "$p" = "." ]; then
+            if [ "$ALLOW_ROOT" != "true" ]; then
+              echo "::error::Zielordner '$p' ist der oberste Ordner des Zugangs. Nur verwenden, wenn der Zugang direkt im Web-Ordner der Website landet – dann 'allow-root: true' setzen."
+              exit 1
+            fi
+            echo "::notice::Zielordner ist der oberste Ordner des Zugangs (allow-root)."
+          elif [[ "$p" =~ ^/(home|root|var|etc|usr|srv|opt|tmp)(/[^/]+)?$ ]]; then
+            echo "::error::Unsicherer Zielordner '$REMOTE_PATH'. Bitte den Web-Ordner der Website angeben, z. B. public_html oder kunde-a.at."
+            exit 1
+          fi
+          echo "Protokoll: $PROTOCOL, Zielordner: $p"
 
       - name: lftp installieren
         run: |
@@ -196,6 +326,7 @@ jobs:
           lftp --version | head -1
 
       - name: SSH vorbereiten
+        if: ${{ inputs.protocol == 'sftp' }}
         env:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
@@ -229,7 +360,7 @@ jobs:
             exit 1
           fi
 
-      - name: Hochladen (SFTP)
+      - name: Hochladen
         env:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
@@ -237,21 +368,58 @@ jobs:
           LFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
           KEEP_REMOTE: ${{ inputs.keep-remote }}
           MAX_DELETE: ${{ inputs.max-delete }}
+          VERIFY_CERT: ${{ inputs.verify-certificate }}
         run: |
           set -euo pipefail
-          port="${SFTP_PORT:-22}"
-          remote="${REMOTE_PATH%/}"
+          remote="$REMOTE_PATH"
+          while [ "${#remote}" -gt 1 ] && [ "${remote%/}" != "$remote" ]; do remote="${remote%/}"; done
           local_dir="$(cd "$OUTPUT_DIR" && pwd)"
           work="$(mktemp -d)"
+          verify=no; [ "$VERIFY_CERT" = "true" ] && verify=yes
 
-          ssh_cmd="ssh -a -x -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ServerAliveInterval=15 -o ConnectTimeout=20"
-          if [ -f "$HOME/.ssh/deploy_key" ]; then
-            ssh_cmd="$ssh_cmd -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -i $HOME/.ssh/deploy_key"
-            open_cmd="open -u \"$SFTP_USER\", -p $port sftp://$SFTP_HOST"
-          else
-            ssh_cmd="$ssh_cmd -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
-            open_cmd="open --env-password -u \"$SFTP_USER\" -p $port sftp://$SFTP_HOST"
-          fi
+          proto_settings=""
+          case "$PROTOCOL" in
+            sftp)
+              port="${SFTP_PORT:-22}"; parallel=4
+              ssh_cmd="ssh -a -x -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ServerAliveInterval=15 -o ConnectTimeout=20"
+              if [ -f "$HOME/.ssh/deploy_key" ]; then
+                ssh_cmd="$ssh_cmd -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -i $HOME/.ssh/deploy_key"
+                open_cmd="open -u \"$SFTP_USER\", -p $port sftp://$SFTP_HOST"
+              else
+                ssh_cmd="$ssh_cmd -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+                open_cmd="open --env-password -u \"$SFTP_USER\" -p $port sftp://$SFTP_HOST"
+              fi
+              proto_settings="set sftp:auto-confirm no
+          set sftp:connect-program \"$ssh_cmd\""
+              ;;
+            ftps|ftps-implicit|ftp)
+              if [ -z "${LFTP_PASSWORD:-}" ]; then
+                echo "::error::Für FTP/FTPS wird das Secret SFTP_PASSWORD benötigt."
+                exit 1
+              fi
+              parallel=3
+              proto_settings="set ftp:passive-mode true
+          set ftp:prefer-epsv false
+          set ssl:verify-certificate $verify"
+              if [ "$PROTOCOL" = "ftps" ]; then
+                port="${SFTP_PORT:-21}"; scheme=ftp
+                proto_settings="$proto_settings
+          set ftp:ssl-force true
+          set ftp:ssl-protect-data true
+          set ftp:ssl-protect-list true"
+              elif [ "$PROTOCOL" = "ftps-implicit" ]; then
+                port="${SFTP_PORT:-990}"; scheme=ftps
+                proto_settings="$proto_settings
+          set ftp:ssl-protect-data true
+          set ftp:ssl-protect-list true"
+              else
+                port="${SFTP_PORT:-21}"; scheme=ftp
+                proto_settings="$proto_settings
+          set ftp:ssl-allow false"
+              fi
+              open_cmd="open --env-password -u \"$SFTP_USER\" -p $port $scheme://$SFTP_HOST"
+              ;;
+          esac
 
           # Geschützte Pfade am Server: werden weder gelöscht noch überschrieben
           excludes=""
@@ -262,7 +430,7 @@ jobs:
             esc="$(printf '%s' "$p" | sed 's/[][\.*^$()+?{}|]/\\&/g')"
             excludes="$excludes --exclude '^${esc}(/|\$)'"
           done
-          mirror_opts="--reverse --verbose=1 --parallel=4 --no-perms --overwrite"
+          mirror_opts="--reverse --verbose=1 --parallel=$parallel --no-perms --overwrite"
 
           preamble() {
             cat <<EOF
@@ -271,8 +439,7 @@ jobs:
           set net:reconnect-interval-base 5
           set net:reconnect-interval-multiplier 2
           set net:timeout 30
-          set sftp:auto-confirm no
-          set sftp:connect-program "$ssh_cmd"
+          $proto_settings
           $open_cmd
           mkdir -p -f "$remote"
           cd "$remote"
@@ -281,6 +448,8 @@ jobs:
 
           # --- Probelauf: Was würde gelöscht? -------------------------------
           { preamble
+            echo "echo __BASE__"
+            echo "pwd"
             echo "mirror $mirror_opts --dry-run --delete $excludes \"$local_dir\" ."
             echo "bye"; } > "$work/plan.lftp"
           lftp -f "$work/plan.lftp" > "$work/plan.txt"
@@ -293,13 +462,13 @@ jobs:
           fi
 
           # Schutz 1: Ordner mit Domain-Namen (z. B. Addon-Domains in public_html) nie löschen
+          urlpath() { printf '%s' "$1" | sed -E 's#^[a-z]+://[^/]*##; s#/+$##'; }
+          base="$(urlpath "$(sed -n '/^__BASE__$/{n;p;q;}' "$work/plan.txt")")"
           blocked=""
-          rel_prefix="/${remote#/}/"
           while IFS= read -r line; do
             case "$line" in "rm -r "*) ;; *) continue ;; esac
-            url="${line#rm -r }"
-            rel="${url#*"$rel_prefix"}"
-            rel="${rel%/}"
+            path="$(urlpath "${line#rm -r }")"
+            rel="${path#"$base"/}"
             if [[ "$rel" != */* && "$rel" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then
               blocked="$blocked $rel"
             fi
@@ -323,7 +492,7 @@ jobs:
             echo "mirror $mirror_opts --delete $excludes \"$local_dir\" ."
             echo "bye"; } > "$work/deploy.lftp"
 
-          echo "Lade nach $SFTP_HOST:$remote hoch …"
+          echo "Lade per $PROTOCOL nach $SFTP_HOST:$remote hoch …"
           lftp -f "$work/deploy.lftp"
           echo "Upload abgeschlossen."
 
@@ -340,12 +509,20 @@ jobs:
             exit 1
           fi
           echo "Live-Check ok: $SITE_URL (HTTP 200)"
+          # Kontrolle, ob der Upload im richtigen Web-Ordner gelandet ist
+          live_commit=$(curl -sSL --max-time 30 "${SITE_URL%/}/deploy-info.json?t=$(date +%s)" | jq -r '.commit // ""' 2>/dev/null || true)
+          if [ "$live_commit" = "$GITHUB_SHA" ]; then
+            echo "deploy-info.json ist online – Zielordner stimmt."
+          else
+            echo "::warning::$SITE_URL/deploy-info.json zeigt nicht den neuen Stand. Zeigt 'remote-path' auf den Web-Ordner dieser Domain, oder liefert ein Cache noch die alte Datei? Sonst baut der nächtliche Lauf jede Nacht neu."
+          fi
 
       - name: Zusammenfassung
         if: ${{ always() }}
         env:
           STATUS: ${{ job.status }}
           SITE_URL: ${{ inputs.site-url }}
+          PROTOCOL: ${{ inputs.protocol }}
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
         run: |
@@ -355,7 +532,7 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Auslöser | $EVENT ${ACTION:+($ACTION)} |"
-            echo "| Zielordner | \`$REMOTE_PATH\` |"
+            echo "| Ziel | $PROTOCOL · \`$REMOTE_PATH\` |"
             echo "| Dateien | ${BUILD_FILES:-–} |"
             if [ -n "$SITE_URL" ]; then echo "| Website | $SITE_URL |"; fi
           } >> "$GITHUB_STEP_SUMMARY"

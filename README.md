@@ -13,6 +13,8 @@ Jedes Website-Repo ruft ihn mit einer kurzen `deploy.yml` auf (Vorlage siehe Anl
 5. Upload in zwei Durchgängen: erst Assets, dann HTML-Seiten und Löschen veralteter Dateien
 6. Live-Check der Website (optional)
 
+Davor läuft der Job **Änderungen prüfen**: Bei `only-if-content-changed: true` vergleicht er den Sanity-Fingerabdruck und Commit mit `https://<site>/deploy-info.json` und überspringt den Build, wenn nichts geändert wurde. Jeder Deploy schreibt diese Datei neu.
+
 ## Eingaben
 
 | Name | Pflicht | Standard | Bedeutung |
@@ -25,10 +27,13 @@ Jedes Website-Repo ruft ihn mit einer kurzen `deploy.yml` auf (Vorlage siehe Anl
 | `working-directory` | nein | `.` | Ordner mit der `package.json` |
 | `keep-remote` | nein | `.well-known cgi-bin .ftpquota` | Pfade am Server, die nie angefasst werden |
 | `max-delete` | nein | `200` | Abbruch bei mehr Löschungen (0 = keine Grenze) |
+| `sanity-project-id` | nein | – | Für den nächtlichen Inhaltsvergleich |
+| `sanity-dataset` | nein | `production` | Sanity-Dataset |
+| `only-if-content-changed` | nein | `false` | Nur bauen, wenn sich Sanity oder Code seit dem letzten Deploy geändert hat (nächtlicher Lauf) |
 
 ## Secrets (im Website-Repo)
 
-`SFTP_HOST`, `SFTP_USER`, optional `SFTP_PORT` (Standard 22), `SFTP_PASSWORD` **oder** `SSH_PRIVATE_KEY`, optional `SFTP_KNOWN_HOSTS` und `BUILD_ENV`.
+`SFTP_HOST`, `SFTP_USER`, optional `SFTP_PORT` (Standard 22), `SFTP_PASSWORD` **oder** `SSH_PRIVATE_KEY`, optional `SFTP_KNOWN_HOSTS`, `BUILD_ENV` und `SANITY_READ_TOKEN` (nur bei privatem Dataset).
 
 ## Änderungen ausrollen
 
